@@ -4,7 +4,7 @@ pipeline {
   }
 
   environment {
-    IMAGE_NAME = "eosc-node-endpoint-service"
+    IMAGE_NAME = "eosc-node-endpoint"
     REGISTRY = "${DOCKER_ARTIFACT_REGISTRY}"
     DOCKER_TAG = "${GIT_COMMIT}"
     DOCKER_IMAGE = "${DOCKER_ARTIFACT_REGISTRY}/${IMAGE_NAME}:${GIT_COMMIT}"
