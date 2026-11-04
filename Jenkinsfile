@@ -1,167 +1,63 @@
 pipeline {
-  agent any
-
-  tools {
-    jdk 'OpenJDK 21'
-  }
-
-  options {
-    buildDiscarder(logRotator(numToKeepStr: '20'))
-    timeout(time: 30, unit: 'MINUTES')
-    timestamps()
+  agent {
+    label 'jnlp-himem'
   }
 
   environment {
     IMAGE_NAME = "eosc-node-endpoint-service"
-    REGISTRY = "docker.madgik.di.uoa.gr"
-    REGISTRY_CRED = 'docker-registry'
-    DOCKER_TAG = ''
+    REGISTRY = "${DOCKER_ARTIFACT_REGISTRY}"
+    DOCKER_TAG = "${GIT_COMMIT}"
+    DOCKER_IMAGE = "${DOCKER_ARTIFACT_REGISTRY}/${IMAGE_NAME}:${GIT_COMMIT}"
   }
 
   stages {
-    stage('Determine Docker Tag') {
-      steps {
-        script {
-          DOCKER_TAG = sh(script: "./mvnw help:evaluate -Dexpression=project.version -q -DforceStdout", returnStdout: true).trim()
-          echo "Docker tag: ${DOCKER_TAG}"
-          currentBuild.displayName = "${currentBuild.displayName}-${DOCKER_TAG}"
-        }
-      }
-    }
-
     stage('Build & Test') {
       steps {
-        sh './mvnw -B clean install'
-      }
-      post {
-        always {
-          junit allowEmptyResults: true, testResults: '**/target/surefire-reports/TEST-*.xml, **/target/failsafe-reports/TEST-*.xml'
+        withMaven {
+          sh './mvnw clean verify'
         }
       }
     }
-
-    stage('Deploy Artifacts') {
-      when {
-        anyOf {
-          expression { return DOCKER_TAG.endsWith('-SNAPSHOT') } // deploy all snapshots
-          expression { return env.TAG_NAME != null } // deploy only tag build as release
-        }
-      }
+    stage('Run Sonar Scan') {
       steps {
-        sh './mvnw deploy -DskipTests'
+        withSonarQubeEnv('cessda-sonar') {
+          withMaven {
+            sh "./mvnw sonar:sonar -Pci"
+          }
+        }
       }
+      when { branch 'main' }
     }
-
+    stage('Get Sonar Quality Gate') {
+      steps {
+        timeout(time: 1, unit: 'HOURS') {
+          waitForQualityGate abortPipeline: true
+        }
+      }
+      when { branch 'main' }
+    }
     stage('Build Image') {
-      when {
-        expression {
-          return env.TAG_NAME != null || env.BRANCH_NAME == 'develop' || env.BRANCH_NAME == 'main'
+      steps {
+        withMaven {
+          sh "./mvnw -pl eosc-node-endpoint-service spring-boot:build-image-no-fork -Dspring-boot.build-image.imageName=${DOCKER_IMAGE}"
         }
       }
-      steps {
-        sh "./mvnw -pl eosc-node-endpoint-service spring-boot:build-image -DskipTests"
-      }
+      when { branch 'main' }
     }
 
     stage('Upload Image') {
-      when {
-        expression {
-          return env.TAG_NAME != null || env.BRANCH_NAME == 'develop' || env.BRANCH_NAME == 'main'
-        }
-      }
       steps {
-        script {
-          def primaryImage = "${REGISTRY}/${IMAGE_NAME}:${DOCKER_TAG}"
-          withCredentials([usernamePassword(credentialsId: "${REGISTRY_CRED}", usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
-            sh """
-              echo "\$DOCKER_PASS" | docker login ${REGISTRY} -u "\$DOCKER_USER" --password-stdin
-              docker push ${primaryImage}
-            """
-            if (env.TAG_NAME) {
-              def minorTag = DOCKER_TAG.tokenize('.').take(2).join('.')
-              def minorImage = "${REGISTRY}/${IMAGE_NAME}:${minorTag}"
-              def latestImage = "${REGISTRY}/${IMAGE_NAME}:latest"
-              sh """
-                docker tag ${primaryImage} ${minorImage}
-                docker push ${minorImage}
-                docker tag ${primaryImage} ${latestImage}
-                docker push ${latestImage}
-              """
-            } else if (DOCKER_TAG.endsWith('-SNAPSHOT')) {
-              def devImage = "${REGISTRY}/${IMAGE_NAME}:dev"
-              sh """
-                docker tag ${primaryImage} ${devImage}
-                docker push ${devImage}
-              """
-            }
-          }
-        }
+        sh "gcloud auth configure-docker ${ARTIFACT_REGISTRY_HOST}"
+        sh "docker push ${DOCKER_IMAGE}"
       }
+      when { branch 'main' }
     }
 
-    stage('Handle Releases') {
-      when {
-        allOf {
-          branch 'main'
-          not { changeRequest() } // skip PR builds
-        }
-      }
+    stage('Deploy Node Endpoint') {
       steps {
-        lock(resource: "release-${IMAGE_NAME}") {
-          retry(5) {
-            script {
-              try {
-                withCredentials([string(credentialsId: 'jenkins-github-pat', variable: 'GH_TOKEN')]) {
-                  sh '''
-                    [ -f /etc/profile.d/load_nvm.sh ] || { echo "ERROR: /etc/profile.d/load_nvm.sh not found. NVM is required on this agent."; exit 1; }
-                    { set +x; } 2>/dev/null
-                    . /etc/profile.d/load_nvm.sh > /dev/null
-                    nvm install --lts > /dev/null
-                    set -x
-                    npx release-please@17 github-release --repo-url ${GIT_URL} --token ${GH_TOKEN}
-
-                    npx release-please@17 release-pr --repo-url ${GIT_URL} --token ${GH_TOKEN}
-                  '''
-                }
-              } catch (e) {
-                sleep time: 45, unit: 'SECONDS'
-                throw e
-              }
-            }
-          }
-        }
+        build job: 'cessda.resource-catalogue.deploy/main', parameters: [string(name: 'NODE_ENDPOINT_IMAGE_TAG', value: GIT_COMMIT)], wait: false
       }
-    }
-
-  }
-
-  post {
-    always {
-      sh """
-        IMAGE_ID=\$(docker inspect --format='{{.Id}}' ${REGISTRY}/${IMAGE_NAME}:${DOCKER_TAG} 2>/dev/null) && docker rmi -f \$IMAGE_ID || true
-      """
-    }
-    failure {
-      emailext(
-        subject: "FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
-        body: """<p>Build <b>${env.JOB_NAME} #${env.BUILD_NUMBER}</b> failed.</p>
-                 <p>Branch: <b>${env.BRANCH_NAME}</b></p>
-                 <p>Check the details: <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>""",
-        mimeType: 'text/html',
-        recipientProviders: [[$class: 'DevelopersRecipientProvider']],
-        to: '$DEFAULT_RECIPIENTS'
-      )
-    }
-    fixed {
-      emailext(
-        subject: "FIXED: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
-        body: """<p>Build <b>${env.JOB_NAME} #${env.BUILD_NUMBER}</b> is back to normal.</p>
-                 <p>Branch: <b>${env.BRANCH_NAME}</b></p>
-                 <p>Check the details: <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>""",
-        mimeType: 'text/html',
-        recipientProviders: [[$class: 'DevelopersRecipientProvider']],
-        to: '$DEFAULT_RECIPIENTS'
-      )
+      when { branch 'main' }
     }
   }
 }
