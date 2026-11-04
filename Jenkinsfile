@@ -14,7 +14,7 @@ pipeline {
     stage('Build & Test') {
       steps {
         withMaven {
-          sh './mvnw clean verify'
+          sh './mvnw clean install'
         }
       }
     }
